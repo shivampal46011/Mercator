@@ -681,6 +681,148 @@ fn scan_project_inner(path: &str) -> Result<FlowGraph, String> {
     })
 }
 
+/* ---------- feature map: AI-driven segregation by product feature ---------- */
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FeatureStep {
+    pub file: String,
+    #[serde(rename = "fn", default)]
+    pub func: Option<String>,
+    #[serde(default)]
+    pub does: String,
+    #[serde(default)]
+    pub example: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Feature {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub flow: Vec<FeatureStep>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct FeatureCache {
+    fp: String,
+    features: Vec<Feature>,
+}
+
+fn features_path(project: &Path) -> PathBuf {
+    project.join(".newgen").join("features.json")
+}
+
+#[tauri::command]
+pub async fn flow_features(project: String, force: bool) -> Result<Vec<Feature>, String> {
+    tauri::async_runtime::spawn_blocking(move || flow_features_inner(&project, force))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn flow_features_inner(project: &str, force: bool) -> Result<Vec<Feature>, String> {
+    use std::hash::{Hash, Hasher};
+    let root = Path::new(project);
+    let graph = scan_project_inner(project)?;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for n in &graph.nodes {
+        n.id.hash(&mut hasher);
+        n.loc.hash(&mut hasher);
+    }
+    graph.edges.len().hash(&mut hasher);
+    let fp = format!("{:x}", hasher.finish());
+
+    if !force {
+        if let Ok(raw) = std::fs::read_to_string(features_path(root)) {
+            if let Ok(cache) = serde_json::from_str::<FeatureCache>(&raw) {
+                if cache.fp == fp && !cache.features.is_empty() {
+                    return Ok(cache.features);
+                }
+            }
+        }
+    }
+
+    let mut prompt = String::from(
+        "Analyze this codebase map and segregate it into product FEATURES (user-facing capabilities), not folders.\n\nFiles (path: purpose):\n",
+    );
+    for n in graph.nodes.iter().take(200) {
+        prompt.push_str(&format!("- {}: {}\n", n.id, n.purpose));
+    }
+    prompt.push_str("\nDependencies (who uses whom):\n");
+    for e in graph
+        .edges
+        .iter()
+        .filter(|e| e.kind == "call" && e.from != e.to)
+        .take(150)
+    {
+        prompt.push_str(&format!("- {} -> {}\n", e.from, e.to));
+    }
+    prompt.push_str(
+        "\nReturn ONLY raw JSON, no markdown fences:\n\
+         {\"features\":[{\"name\":\"...\",\"description\":\"max 12 words\",\"files\":[\"path\"],\
+         \"flow\":[{\"file\":\"path\",\"fn\":\"realFunctionName or null\",\"does\":\"what happens at this step, max 10 words\",\
+         \"example\":\"tiny concrete example data at this step\"}]}]}\n\
+         Rules: 3-8 features. flow = the ordered path data takes through the feature (3-8 steps), \
+         from the inlet/entry to the final output, with a concrete example payload evolving step by step \
+         (e.g. step 1 'GET /api/home', step 2 '{\"city\":\"NYC\"}', step 3 '{\"city\":\"NYC\",\"temp\":21}'). \
+         Use only file paths from the list above.\n",
+    );
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let output = Command::new(&shell)
+        .arg("-lc")
+        .arg("claude -p \"$NEWGEN_PROMPT\" --output-format json")
+        .current_dir(root)
+        .env("NEWGEN_PROMPT", &prompt)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "claude failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(400)
+                .collect::<String>()
+        ));
+    }
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("bad claude output: {e}"))?;
+    let mut result = envelope["result"].as_str().unwrap_or_default().trim().to_string();
+    if result.starts_with("```") {
+        result = result
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string();
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result).map_err(|e| format!("could not parse feature map: {e}"))?;
+    let features: Vec<Feature> = serde_json::from_value(parsed["features"].clone())
+        .map_err(|e| format!("bad feature map shape: {e}"))?;
+
+    std::fs::create_dir_all(root.join(".newgen")).map_err(|e| e.to_string())?;
+    std::fs::write(
+        features_path(root),
+        serde_json::to_string_pretty(&FeatureCache {
+            fp,
+            features: features.clone(),
+        })
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(features)
+}
+
+/* ---------- per-block AI purposes ---------- */
+
 type Needs = Vec<(String, Vec<String>)>;
 
 const ANNOTATE_CHUNK: usize = 30;

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   BackgroundVariant,
   Controls,
   Handle,
   MiniMap,
+  Panel,
   Position,
   ReactFlow,
   type Edge,
@@ -15,8 +16,8 @@ import {
 import dagre from "@dagrejs/dagre";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xyflow/react/dist/style.css";
-import type { FlowGraph } from "../types";
-import { flowAnnotate, readFile, scanProject } from "../lib/ipc";
+import type { Feature, FlowGraph } from "../types";
+import { flowAnnotate, flowFeatures, readFile, scanProject } from "../lib/ipc";
 import { loadSettings } from "../lib/settings";
 
 const ROLE_STYLE: Record<string, { icon: string; label: string; accent: string; border: string }> = {
@@ -32,14 +33,16 @@ const ROLE_STYLE: Record<string, { icon: string; label: string; accent: string; 
   test: { icon: "✓", label: "Safety net", accent: "text-emerald-300", border: "border-emerald-500/40" },
 };
 
-type Level = "modules" | "files" | "detail";
-const levelFor = (zoom: number): Level => (zoom < 0.5 ? "modules" : zoom < 1.05 ? "files" : "detail");
-const LEVEL_ZOOM: Record<Level, number> = { modules: 0.35, files: 0.8, detail: 1.25 };
-
 const MAX_ROWS = 8;
 const FILE_W = 240;
 const FUNC_W = 208;
 const FUNC_H = 66;
+
+/** Degradation thresholds: past these, the canvas trades decoration for framerate. */
+const PERF = {
+  bigView: 220, // rendered blocks in one view: beyond this, no animated edges
+  minimapMax: 350,
+};
 
 const fileCardHeight = (shown: number, hidden: number) =>
   104 + (shown > 0 ? 8 + shown * 19 + (hidden > 0 ? 13 : 0) : 0) + 18;
@@ -56,24 +59,7 @@ const moduleOf = (id: string) => {
   return parts.slice(0, Math.min(2, parts.length - 1)).join("/");
 };
 
-/* ---------- masonry placement inside a boundary box ---------- */
-
-function masonry(items: { id: string; h: number }[], itemW: number, headerH: number) {
-  const cols = items.length > 6 ? 2 : 1;
-  const pad = 14;
-  const colY: number[] = Array(cols).fill(headerH + pad);
-  const pos: Record<string, { x: number; y: number }> = {};
-  for (const it of items) {
-    let c = 0;
-    for (let i = 1; i < cols; i++) if (colY[i] < colY[c]) c = i;
-    pos[it.id] = { x: pad + c * (itemW + pad), y: colY[c] };
-    colY[c] += it.h + pad;
-  }
-  const h = Math.max(...colY, headerH + pad) + 4;
-  return { pos, w: pad + cols * (itemW + pad), h };
-}
-
-/* ---------- nodes ---------- */
+/* ---------- node components ---------- */
 
 type FileNodeData = {
   name: string;
@@ -90,6 +76,7 @@ type FileNodeData = {
   usedBy: number;
   onOpen: () => void;
   onEdit: () => void;
+  onDrill: () => void;
 };
 type FileFlowNode = Node<FileNodeData, "file">;
 
@@ -97,7 +84,8 @@ function FileNode({ data }: NodeProps<FileFlowNode>) {
   const style = ROLE_STYLE[data.role] ?? ROLE_STYLE.util;
   return (
     <div
-      onDoubleClick={data.onOpen}
+      onClick={data.onDrill}
+      title="click to open this file's functions"
       className={`w-[240px] rounded-xl border ${style.border} bg-[#101015]/95 shadow-[0_4px_24px_rgba(0,0,0,0.35)] hover:shadow-[0_0_24px_rgba(124,92,255,0.18)] transition-all cursor-pointer group`}
     >
       <Handle type="target" position={Position.Left} id="in" className="!size-2 !bg-violet-500/70 !border-0" />
@@ -164,35 +152,54 @@ function FileNode({ data }: NodeProps<FileFlowNode>) {
         >
           ✎ ai edit
         </button>
-        <span className="opacity-0 group-hover:opacity-100 text-violet-400 transition-opacity">open ↗</span>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            data.onOpen();
+          }}
+          className="opacity-0 group-hover:opacity-100 text-violet-400 hover:text-violet-300 transition-opacity"
+          title="Open in the code editor"
+        >
+          open ↗
+        </button>
       </div>
     </div>
   );
 }
 
-type BoundaryNodeData = { label: string; sub?: string; tone: "service" | "file" };
-type BoundaryFlowNode = Node<BoundaryNodeData, "boundary">;
+type ServiceNodeData = { label: string; sub: string; onDrill: () => void };
+type ServiceFlowNode = Node<ServiceNodeData, "service">;
 
-function BoundaryNode({ data }: NodeProps<BoundaryFlowNode>) {
-  const service = data.tone === "service";
+function ServiceNode({ data }: NodeProps<ServiceFlowNode>) {
   return (
     <div
-      className={`w-full h-full rounded-2xl border border-dashed ${
-        service ? "border-zinc-700/80 bg-zinc-500/[0.03]" : "border-violet-500/25 bg-violet-500/[0.03]"
-      }`}
+      onClick={data.onDrill}
+      title="click to open this service"
+      className="w-[280px] rounded-2xl border-2 border-zinc-700 bg-[#101015]/95 shadow-[0_6px_32px_rgba(0,0,0,0.45)] hover:border-violet-500/50 transition-all cursor-pointer px-4 py-3.5"
     >
-      <Handle type="target" position={Position.Left} id="in" className="!size-2 !bg-violet-500/60 !border-0" />
-      <Handle type="source" position={Position.Right} id="out" className="!size-2 !bg-cyan-400/60 !border-0" />
-      <div className="px-3.5 py-2 flex items-baseline gap-2 overflow-hidden">
-        <span
-          className={`text-[10.5px] font-semibold tracking-widest uppercase truncate ${
-            service ? "text-zinc-400" : "text-violet-300/90"
-          }`}
-        >
-          {data.label}
-        </span>
-        {data.sub && <span className="text-[9.5px] text-zinc-600 truncate">{data.sub}</span>}
-      </div>
+      <Handle type="target" position={Position.Left} id="in" className="!size-2.5 !bg-violet-500/70 !border-0" />
+      <Handle type="source" position={Position.Right} id="out" className="!size-2.5 !bg-cyan-400/70 !border-0" />
+      <div className="text-[15px] font-semibold text-zinc-100 truncate">{data.label}</div>
+      <div className="mt-1.5 text-[10px] text-zinc-500 leading-relaxed line-clamp-2">{data.sub}</div>
+      <div className="mt-1.5 text-[9px] text-zinc-600">click to open</div>
+    </div>
+  );
+}
+
+type PortalNodeData = { label: string; sub?: string; onDrill: () => void };
+type PortalFlowNode = Node<PortalNodeData, "portal">;
+
+function PortalNode({ data }: NodeProps<PortalFlowNode>) {
+  return (
+    <div
+      onClick={data.onDrill}
+      title="connection outside this view — click to go there"
+      className="w-[190px] rounded-lg border border-dashed border-zinc-700 bg-zinc-900/60 px-2.5 py-1.5 cursor-pointer hover:border-cyan-500/60 transition-colors"
+    >
+      <Handle type="target" position={Position.Left} id="in" className="!size-1.5 !bg-violet-400/70 !border-0" />
+      <Handle type="source" position={Position.Right} id="out" className="!size-1.5 !bg-cyan-400/70 !border-0" />
+      <div className="text-[10.5px] text-zinc-400 truncate">⇄ {data.label}</div>
+      {data.sub && <div className="text-[8.5px] text-zinc-600 truncate mt-0.5">{data.sub}</div>}
     </div>
   );
 }
@@ -223,7 +230,56 @@ function FuncNode({ data }: NodeProps<FuncFlowNode>) {
   );
 }
 
-const nodeTypes = { file: FileNode, boundary: BoundaryNode, func: FuncNode };
+type StepNodeData = {
+  idx: number;
+  total: number;
+  file: string;
+  fn?: string | null;
+  does: string;
+  example: string;
+  state: "done" | "active" | "pending";
+  onSelect: () => void;
+};
+type StepFlowNode = Node<StepNodeData, "step">;
+
+function StepNode({ data }: NodeProps<StepFlowNode>) {
+  const tone =
+    data.state === "active"
+      ? "border-violet-400 shadow-[0_0_30px_rgba(139,92,246,0.45)]"
+      : data.state === "done"
+        ? "border-violet-500/40"
+        : "border-zinc-800 opacity-75";
+  return (
+    <div
+      onClick={data.onSelect}
+      className={`w-[250px] rounded-xl border-2 ${tone} bg-[#101015]/95 px-3 py-2.5 cursor-pointer transition-all`}
+    >
+      <Handle type="target" position={Position.Left} id="in" className="!size-1.5 !bg-violet-400/80 !border-0" />
+      <Handle type="source" position={Position.Right} id="out" className="!size-1.5 !bg-amber-400/90 !border-0" />
+      <div className="text-[9px] text-zinc-500 tracking-widest">
+        STEP {data.idx + 1}/{data.total}
+      </div>
+      <div className="text-[12px] text-zinc-200 mt-0.5 leading-snug">{data.does}</div>
+      <div className="text-[9.5px] font-mono text-zinc-500 mt-1 truncate">
+        {data.file.split("/").pop()}
+        {data.fn ? ` · ƒ ${data.fn}` : ""}
+      </div>
+      {data.state === "active" && data.example && (
+        <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] font-mono text-amber-200 break-all">
+          {data.example}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const nodeTypes = {
+  file: memo(FileNode),
+  service: memo(ServiceNode),
+  portal: memo(PortalNode),
+  func: memo(FuncNode),
+  step: memo(StepNode),
+};
 
 /* ---------- impact analysis ---------- */
 
@@ -252,6 +308,8 @@ function computeImpact(graph: FlowGraph, fileId: string) {
 
 /* ---------- flow view ---------- */
 
+type Crumb = { kind: "service"; id: string } | { kind: "file"; id: string };
+
 interface Props {
   projectPath: string;
   onOpenFile: (absPath: string) => void;
@@ -270,13 +328,18 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
   const [annotating, setAnnotating] = useState(false);
   const [annotateProgress, setAnnotateProgress] = useState<{ done: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [level, setLevel] = useState<Level>("files");
+  const [drill, setDrill] = useState<Crumb[]>([]);
   const [editTarget, setEditTarget] = useState<string | null>(null);
   const [editRequest, setEditRequest] = useState("");
   const [peek, setPeek] = useState<Peek | null>(null);
   const [peekCode, setPeekCode] = useState<string | null>(null);
+  const [features, setFeatures] = useState<Feature[] | null>(null);
+  const [featuresLoading, setFeaturesLoading] = useState(false);
+  const [activeFeature, setActiveFeature] = useState<Feature | null>(null);
+  const [playStep, setPlayStep] = useState(-1);
+  const [playing, setPlaying] = useState(false);
   const autoRan = useRef(false);
-  const levelRef = useRef<Level>("files");
+  const featuresRan = useRef(false);
   const rfRef = useRef<ReactFlowInstance | null>(null);
 
   const refresh = useCallback(() => {
@@ -290,9 +353,52 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
 
   useEffect(() => {
     autoRan.current = false;
+    featuresRan.current = false;
+    setDrill([]);
+    setFeatures(null);
+    setActiveFeature(null);
+    setPlayStep(-1);
+    setPlaying(false);
   }, [projectPath]);
 
+  const loadFeatures = useCallback(
+    async (force: boolean) => {
+      setFeaturesLoading(true);
+      try {
+        setFeatures(await flowFeatures(projectPath, force));
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setFeaturesLoading(false);
+      }
+    },
+    [projectPath],
+  );
+
+  // Feature playback: example data hops one step at a time.
+  useEffect(() => {
+    if (!playing || !activeFeature) return;
+    if (playStep >= activeFeature.flow.length - 1) {
+      setPlaying(false);
+      return;
+    }
+    const t = setTimeout(() => setPlayStep((s) => s + 1), 1500);
+    return () => clearTimeout(t);
+  }, [playing, playStep, activeFeature]);
+
   useEffect(refresh, [refresh]);
+
+  // Drop crumbs that no longer exist after a rescan.
+  useEffect(() => {
+    if (!graph) return;
+    setDrill((d) =>
+      d.filter((c) =>
+        c.kind === "service"
+          ? graph.nodes.some((n) => moduleOf(n.id) === c.id)
+          : graph.nodes.some((n) => n.id === c.id),
+      ),
+    );
+  }, [graph]);
 
   const [refreshCfg, setRefreshCfg] = useState(() => {
     const s = loadSettings();
@@ -320,8 +426,6 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     return () => clearInterval(t);
   }, [refresh, refreshCfg]);
 
-  // Fire-and-forget: the command returns the queued count instantly; progress and
-  // completion arrive as events while the UI stays fully responsive.
   const annotate = useCallback(async () => {
     setError(null);
     try {
@@ -342,13 +446,10 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     const unsubs: UnlistenFn[] = [];
     let off = false;
     void (async () => {
-      const onProgress = await listen<{ done: number; total: number }>(
-        "flow-annotate-progress",
-        (e) => {
-          setAnnotateProgress(e.payload);
-          refreshRef.current(); // purposes appear on the map batch by batch
-        },
-      );
+      const onProgress = await listen<{ done: number; total: number }>("flow-annotate-progress", (e) => {
+        setAnnotateProgress(e.payload);
+        refreshRef.current();
+      });
       const onDone = await listen("flow-annotate-done", () => {
         setAnnotating(false);
         setAnnotateProgress(null);
@@ -381,7 +482,13 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     }
   }, [graph, annotate, annotating]);
 
-  // Code peek: fetch the function's lines on demand.
+  // Load the feature map once per project (cached on disk — instant when unchanged).
+  useEffect(() => {
+    if (!graph || featuresRan.current || graph.nodes.length === 0) return;
+    featuresRan.current = true;
+    void loadFeatures(false);
+  }, [graph, loadFeatures]);
+
   useEffect(() => {
     if (!peek) {
       setPeekCode(null);
@@ -399,15 +506,383 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     };
   }, [peek, projectPath]);
 
-  const setZoomLevel = useCallback((l: Level) => {
-    rfRef.current?.zoomTo(LEVEL_ZOOM[l], { duration: 350 });
+  const multiModule = useMemo(() => {
+    if (!graph) return false;
+    return new Set(graph.nodes.map((n) => moduleOf(n.id))).size > 1;
+  }, [graph]);
+
+  const drillService = useCallback((id: string) => setDrill([{ kind: "service", id }]), []);
+  const drillFile = useCallback(
+    (id: string) =>
+      setDrill(
+        multiModule
+          ? [
+              { kind: "service", id: moduleOf(id) },
+              { kind: "file", id },
+            ]
+          : [{ kind: "file", id }],
+      ),
+    [multiModule],
+  );
+
+  const viewKey = drill.map((c) => `${c.kind}:${c.id}`).join("/") || "root";
+  const navKey = activeFeature ? `feature:${activeFeature.name}` : viewKey;
+
+  // Re-frame the canvas and close overlays when navigating.
+  useEffect(() => {
+    setPeek(null);
+    setEditTarget(null);
+    const t = setTimeout(() => rfRef.current?.fitView({ duration: 300, maxZoom: 1, padding: 0.15 }), 60);
+    return () => clearTimeout(t);
+  }, [navKey]);
+
+  // Esc: close overlays first, then exit feature mode, then climb a level.
+  const escState = useRef({ peek: false, edit: false, feature: false });
+  escState.current = { peek: !!peek, edit: !!editTarget, feature: !!activeFeature };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const s = escState.current;
+      if (s.peek) setPeek(null);
+      else if (s.edit) setEditTarget(null);
+      else if (s.feature) {
+        setActiveFeature(null);
+        setPlaying(false);
+        setPlayStep(-1);
+      } else setDrill((d) => d.slice(0, -1));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  const layoutCache = useRef(new Map<string, { nodes: Node[]; edges: Edge[] }>());
+  useEffect(() => {
+    layoutCache.current.clear();
+  }, [graph]);
 
   const { nodes, edges } = useMemo(() => {
     if (!graph) return { nodes: [] as Node[], edges: [] as Edge[] };
 
-    /* ----- modules: aggregated service blocks ----- */
-    if (level === "modules") {
+    /* ----- feature mode: the feature's flow as an animated pipeline ----- */
+    if (activeFeature) {
+      const steps = activeFeature.flow;
+      const W = 250;
+      const GAP = 110;
+      const stepNodes: Node[] = steps.map((s, i) => ({
+        id: `step:${i}`,
+        type: "step",
+        position: { x: i * (W + GAP), y: (i % 2) * 36 },
+        data: {
+          idx: i,
+          total: steps.length,
+          file: s.file,
+          fn: s.fn,
+          does: s.does,
+          example: s.example,
+          state: i === playStep ? "active" : i < playStep ? "done" : "pending",
+          onSelect: () => {
+            setPlaying(false);
+            setPlayStep(i);
+          },
+        },
+      }));
+      const stepEdges: Edge[] = steps.slice(0, -1).map((_, i) => ({
+        id: `se-${i}`,
+        source: `step:${i}`,
+        target: `step:${i + 1}`,
+        sourceHandle: "out",
+        targetHandle: "in",
+        animated: i === playStep,
+        style: {
+          stroke:
+            i < playStep
+              ? "rgba(139,92,246,0.7)"
+              : i === playStep
+                ? "rgba(251,191,36,0.85)"
+                : "rgba(113,113,122,0.3)",
+          strokeWidth: i <= playStep ? 2 : 1.2,
+        },
+      }));
+      return { nodes: stepNodes, edges: stepEdges };
+    }
+
+    const cached = layoutCache.current.get(viewKey);
+    if (cached) return cached;
+
+    const last = drill[drill.length - 1];
+    const result = (() => {
+      /* ----- file view: this file's functions + portals to connected files ----- */
+      if (last?.kind === "file") {
+        const file = graph.nodes.find((n) => n.id === last.id);
+        if (!file) return { nodes: [] as Node[], edges: [] as Edge[] };
+        const fnSet = new Set(file.functions.map((f) => f.name));
+
+        const g = new dagre.graphlib.Graph();
+        g.setDefaultEdgeLabel(() => ({}));
+        g.setGraph({ rankdir: "LR", nodesep: 26, ranksep: 90, marginx: 50, marginy: 50 });
+        for (const f of file.functions) g.setNode(`fn:${f.name}`, { width: FUNC_W, height: FUNC_H });
+
+        // portals: one per external file this file talks to
+        const portals = new Map<string, { inbound: boolean; outbound: boolean }>();
+        for (const e of graph.edges) {
+          if (e.from === last.id && e.to !== last.id) {
+            const p = portals.get(e.to) ?? { inbound: false, outbound: false };
+            p.outbound = true;
+            portals.set(e.to, p);
+          } else if (e.to === last.id && e.from !== last.id) {
+            const p = portals.get(e.from) ?? { inbound: false, outbound: false };
+            p.inbound = true;
+            portals.set(e.from, p);
+          }
+        }
+        for (const ext of portals.keys()) g.setNode(`portal:${ext}`, { width: 190, height: 50 });
+
+        const rfEdges: Edge[] = [];
+        const seenEdge = new Set<string>();
+        graph.edges.forEach((e, i) => {
+          const isCall = e.kind === "call";
+          const style = isCall
+            ? { stroke: "rgba(124,92,255,0.5)", strokeWidth: 1.5 }
+            : { stroke: "rgba(113,113,122,0.3)", strokeWidth: 1, strokeDasharray: "4 4" };
+          // intra-file
+          if (e.from === last.id && e.to === last.id) {
+            if (e.fromFn && e.toFn && fnSet.has(e.fromFn) && fnSet.has(e.toFn)) {
+              const k = `i:${e.fromFn}->${e.toFn}`;
+              if (seenEdge.has(k)) return;
+              seenEdge.add(k);
+              g.setEdge(`fn:${e.fromFn}`, `fn:${e.toFn}`);
+              rfEdges.push({
+                id: `e-${i}`,
+                source: `fn:${e.fromFn}`,
+                target: `fn:${e.toFn}`,
+                sourceHandle: "out",
+                targetHandle: "in",
+                animated: true,
+                style: { stroke: "rgba(56,189,248,0.5)", strokeWidth: 1.5 },
+              });
+            }
+            return;
+          }
+          // outbound
+          if (e.from === last.id && portals.has(e.to)) {
+            const src = e.fromFn && fnSet.has(e.fromFn) ? `fn:${e.fromFn}` : null;
+            if (!src) return;
+            const k = `o:${e.fromFn}->${e.to}`;
+            if (seenEdge.has(k)) return;
+            seenEdge.add(k);
+            g.setEdge(src, `portal:${e.to}`);
+            rfEdges.push({
+              id: `e-${i}`,
+              source: src,
+              target: `portal:${e.to}`,
+              sourceHandle: "out",
+              targetHandle: "in",
+              animated: isCall,
+              style,
+            });
+            return;
+          }
+          // inbound
+          if (e.to === last.id && portals.has(e.from)) {
+            const tgt = e.toFn && fnSet.has(e.toFn) ? `fn:${e.toFn}` : null;
+            if (!tgt) return;
+            const k = `in:${e.from}->${e.toFn}`;
+            if (seenEdge.has(k)) return;
+            seenEdge.add(k);
+            g.setEdge(`portal:${e.from}`, tgt);
+            rfEdges.push({
+              id: `e-${i}`,
+              source: `portal:${e.from}`,
+              target: tgt,
+              sourceHandle: "out",
+              targetHandle: "in",
+              animated: isCall,
+              style,
+            });
+          }
+        });
+
+        dagre.layout(g);
+        const rfNodes: Node[] = [];
+        for (const f of file.functions) {
+          const pos = g.node(`fn:${f.name}`);
+          rfNodes.push({
+            id: `fn:${f.name}`,
+            type: "func",
+            position: { x: pos.x - FUNC_W / 2, y: pos.y - FUNC_H / 2 },
+            data: {
+              name: f.name,
+              subtitle: humanize(f.name),
+              lines: Math.max(1, f.endLine - f.startLine + 1),
+              onPeek: () => setPeek({ file: last.id, fn: f.name, start: f.startLine, end: f.endLine }),
+            },
+          });
+        }
+        for (const [ext] of portals) {
+          const pos = g.node(`portal:${ext}`);
+          const extNode = graph.nodes.find((n) => n.id === ext);
+          rfNodes.push({
+            id: `portal:${ext}`,
+            type: "portal",
+            position: { x: pos.x - 95, y: pos.y - 25 },
+            data: {
+              label: ext.split("/").pop() ?? ext,
+              sub: extNode?.purpose,
+              onDrill: () => drillFile(ext),
+            },
+          });
+        }
+        return { nodes: rfNodes, edges: rfEdges };
+      }
+
+      /* ----- service view: this service's files + portals to other services ----- */
+      if (last?.kind === "service" || !multiModule) {
+        const serviceId = last?.kind === "service" ? last.id : null;
+        const files = serviceId
+          ? graph.nodes.filter((n) => moduleOf(n.id) === serviceId)
+          : graph.nodes;
+        const fileSet = new Set(files.map((f) => f.id));
+        const big = files.length > PERF.bigView;
+
+        const wired = new Map<string, Set<string>>();
+        for (const e of graph.edges) {
+          if (e.fromFn && fileSet.has(e.from)) {
+            if (!wired.has(e.from)) wired.set(e.from, new Set());
+            wired.get(e.from)!.add(e.fromFn);
+          }
+          if (e.toFn && fileSet.has(e.to)) {
+            if (!wired.has(e.to)) wired.set(e.to, new Set());
+            wired.get(e.to)!.add(e.toFn);
+          }
+        }
+        const shownByFile = new Map<string, string[]>();
+        for (const n of files) {
+          const w = wired.get(n.id) ?? new Set();
+          const names = n.functions.map((f) => f.name);
+          const ordered = [...names.filter((f) => w.has(f)), ...names.filter((f) => !w.has(f))];
+          shownByFile.set(n.id, ordered.slice(0, MAX_ROWS));
+        }
+
+        // portals to other services
+        const portals = new Map<string, { count: number }>();
+        if (serviceId) {
+          for (const e of graph.edges) {
+            const fromIn = fileSet.has(e.from);
+            const toIn = fileSet.has(e.to);
+            if (fromIn === toIn) continue;
+            const ext = moduleOf(fromIn ? e.to : e.from);
+            const p = portals.get(ext) ?? { count: 0 };
+            p.count += 1;
+            portals.set(ext, p);
+          }
+        }
+
+        const g = new dagre.graphlib.Graph();
+        g.setDefaultEdgeLabel(() => ({}));
+        g.setGraph({ rankdir: "LR", nodesep: 32, ranksep: 100, marginx: 50, marginy: 50 });
+        for (const n of files) {
+          const shown = shownByFile.get(n.id) ?? [];
+          g.setNode(n.id, {
+            width: FILE_W,
+            height: fileCardHeight(shown.length, n.functions.length - shown.length),
+          });
+        }
+        for (const ext of portals.keys()) g.setNode(`portal:${ext}`, { width: 190, height: 50 });
+
+        const rfEdges: Edge[] = [];
+        const pairSeen = new Set<string>();
+        const portalPair = new Set<string>();
+        graph.edges.forEach((e, i) => {
+          if (e.from === e.to) return;
+          const fromIn = fileSet.has(e.from);
+          const toIn = fileSet.has(e.to);
+          const isCall = e.kind === "call";
+          if (fromIn && toIn) {
+            const k = `${e.from}|${e.fromFn ?? ""}->${e.to}|${e.toFn ?? ""}`;
+            if (pairSeen.has(k)) return;
+            pairSeen.add(k);
+            g.setEdge(e.from, e.to);
+            const fromShown = shownByFile.get(e.from) ?? [];
+            const toShown = shownByFile.get(e.to) ?? [];
+            rfEdges.push({
+              id: `e-${i}`,
+              source: e.from,
+              target: e.to,
+              sourceHandle: e.fromFn && fromShown.includes(e.fromFn) ? `out-${e.fromFn}` : "out",
+              targetHandle: e.toFn && toShown.includes(e.toFn) ? `in-${e.toFn}` : "in",
+              animated: isCall && !big,
+              style: isCall
+                ? { stroke: "rgba(124,92,255,0.45)", strokeWidth: 1.5 }
+                : { stroke: "rgba(113,113,122,0.25)", strokeWidth: 1, strokeDasharray: "4 4" },
+            });
+          } else if (serviceId && fromIn !== toIn) {
+            const ext = moduleOf(fromIn ? e.to : e.from);
+            const inner = fromIn ? e.from : e.to;
+            const k = fromIn ? `${inner}->portal:${ext}` : `portal:${ext}->${inner}`;
+            if (portalPair.has(k)) return;
+            portalPair.add(k);
+            if (fromIn) g.setEdge(inner, `portal:${ext}`);
+            else g.setEdge(`portal:${ext}`, inner);
+            rfEdges.push({
+              id: `pe-${i}`,
+              source: fromIn ? inner : `portal:${ext}`,
+              target: fromIn ? `portal:${ext}` : inner,
+              sourceHandle: "out",
+              targetHandle: "in",
+              animated: false,
+              style: { stroke: "rgba(113,113,122,0.3)", strokeWidth: 1, strokeDasharray: "4 4" },
+            });
+          }
+        });
+
+        dagre.layout(g);
+        const rfNodes: Node[] = [];
+        for (const n of files) {
+          const pos = g.node(n.id);
+          const shown = shownByFile.get(n.id) ?? [];
+          rfNodes.push({
+            id: n.id,
+            type: "file",
+            position: { x: pos.x - FILE_W / 2, y: pos.y - pos.height / 2 },
+            data: {
+              name: n.name,
+              dir: n.dir,
+              shownFns: shown,
+              hiddenCount: n.functions.length - shown.length,
+              loc: n.loc,
+              role: n.role,
+              purpose: n.purpose,
+              ai: n.ai,
+              inlet: n.inlet,
+              outlet: n.outlet,
+              uses: n.uses,
+              usedBy: n.usedBy,
+              onOpen: () => onOpenFile(`${projectPath}/${n.id}`),
+              onEdit: () => {
+                setEditTarget(n.id);
+                setEditRequest("");
+              },
+              onDrill: () => drillFile(n.id),
+            },
+          });
+        }
+        for (const [ext, p] of portals) {
+          const pos = g.node(`portal:${ext}`);
+          rfNodes.push({
+            id: `portal:${ext}`,
+            type: "portal",
+            position: { x: pos.x - 95, y: pos.y - 25 },
+            data: {
+              label: ext,
+              sub: `${p.count} connection${p.count > 1 ? "s" : ""}`,
+              onDrill: () => drillService(ext),
+            },
+          });
+        }
+        return { nodes: rfNodes, edges: rfEdges };
+      }
+
+      /* ----- root: services ----- */
       interface Mod {
         count: number;
         roles: Map<string, number>;
@@ -438,7 +913,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
       const g = new dagre.graphlib.Graph();
       g.setDefaultEdgeLabel(() => ({}));
       g.setGraph({ rankdir: "LR", nodesep: 50, ranksep: 130, marginx: 60, marginy: 60 });
-      for (const name of mods.keys()) g.setNode(name, { width: 280, height: 110 });
+      for (const name of mods.keys()) g.setNode(name, { width: 280, height: 120 });
       for (const k of agg.keys()) {
         const [a, b] = k.split("→");
         g.setEdge(a, b);
@@ -457,13 +932,12 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
           .join(" · ");
         return {
           id: `svc:${name}`,
-          type: "boundary",
-          position: { x: pos.x - 140, y: pos.y - 55 },
-          style: { width: 280, height: 110 },
+          type: "service",
+          position: { x: pos.x - 140, y: pos.y - 60 },
           data: {
             label: name,
             sub: `${m.count} files · ${topRoles}${m.inlet ? " · ⇥in" : ""}${m.outlet ? " · out↦" : ""}`,
-            tone: "service" as const,
+            onDrill: () => drillService(name),
           },
         };
       });
@@ -475,7 +949,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
           target: `svc:${b}`,
           sourceHandle: "out",
           targetHandle: "in",
-          animated: v.call,
+          animated: v.call && mods.size <= 60,
           label: v.count > 1 ? `${v.count}` : undefined,
           labelStyle: { fill: "#71717a", fontSize: 10 },
           labelBgStyle: { fill: "#0a0a0e" },
@@ -486,216 +960,11 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
         };
       });
       return { nodes: rfNodes, edges: rfEdges };
-    }
+    })();
 
-    /* ----- detail: file boundaries containing function blocks ----- */
-    if (level === "detail") {
-      const fnExists = new Map<string, Set<string>>();
-      for (const n of graph.nodes) fnExists.set(n.id, new Set(n.functions.map((f) => f.name)));
-
-      const geo = new Map<string, ReturnType<typeof masonry>>();
-      for (const n of graph.nodes) {
-        geo.set(
-          n.id,
-          masonry(
-            n.functions.map((f) => ({ id: f.name, h: FUNC_H })),
-            FUNC_W,
-            34,
-          ),
-        );
-      }
-
-      const g = new dagre.graphlib.Graph();
-      g.setDefaultEdgeLabel(() => ({}));
-      g.setGraph({ rankdir: "LR", nodesep: 46, ranksep: 120, marginx: 50, marginy: 50 });
-      for (const n of graph.nodes) {
-        const m = geo.get(n.id)!;
-        g.setNode(n.id, { width: Math.max(m.w, 236), height: Math.max(m.h, 64) });
-      }
-      const pairSeen = new Set<string>();
-      for (const e of graph.edges) {
-        if (e.from === e.to) continue;
-        const key = `${e.from}→${e.to}`;
-        if (!pairSeen.has(key)) {
-          pairSeen.add(key);
-          g.setEdge(e.from, e.to);
-        }
-      }
-      dagre.layout(g);
-
-      const groupNodes: Node[] = [];
-      const childNodes: Node[] = [];
-      for (const n of graph.nodes) {
-        const m = geo.get(n.id)!;
-        const pos = g.node(n.id);
-        const w = Math.max(m.w, 236);
-        const h = Math.max(m.h, 64);
-        groupNodes.push({
-          id: `grp:${n.id}`,
-          type: "boundary",
-          position: { x: pos.x - w / 2, y: pos.y - h / 2 },
-          style: { width: w, height: h },
-          data: { label: n.name, sub: n.purpose, tone: "file" as const },
-        });
-        for (const f of n.functions) {
-          childNodes.push({
-            id: `fn:${n.id}#${f.name}`,
-            type: "func",
-            parentId: `grp:${n.id}`,
-            extent: "parent",
-            position: m.pos[f.name],
-            data: {
-              name: f.name,
-              subtitle: humanize(f.name),
-              lines: Math.max(1, f.endLine - f.startLine + 1),
-              onPeek: () => setPeek({ file: n.id, fn: f.name, start: f.startLine, end: f.endLine }),
-            },
-          });
-        }
-      }
-
-      const rfEdges: Edge[] = [];
-      graph.edges.forEach((e, i) => {
-        const srcFn = e.fromFn && fnExists.get(e.from)?.has(e.fromFn);
-        const tgtFn = e.toFn && fnExists.get(e.to)?.has(e.toFn);
-        if (e.from === e.to && !(srcFn && tgtFn)) return;
-        const isCall = e.kind === "call";
-        rfEdges.push({
-          id: `e-${i}`,
-          source: srcFn ? `fn:${e.from}#${e.fromFn}` : `grp:${e.from}`,
-          target: tgtFn ? `fn:${e.to}#${e.toFn}` : `grp:${e.to}`,
-          sourceHandle: "out",
-          targetHandle: "in",
-          animated: isCall,
-          style: isCall
-            ? { stroke: e.from === e.to ? "rgba(56,189,248,0.45)" : "rgba(124,92,255,0.45)", strokeWidth: 1.5 }
-            : { stroke: "rgba(113,113,122,0.25)", strokeWidth: 1, strokeDasharray: "4 4" },
-        });
-      });
-      return { nodes: [...groupNodes, ...childNodes], edges: rfEdges };
-    }
-
-    /* ----- files: service boundaries containing file cards ----- */
-    const wired = new Map<string, Set<string>>();
-    const mark = (file: string, fn?: string) => {
-      if (!fn) return;
-      if (!wired.has(file)) wired.set(file, new Set());
-      wired.get(file)!.add(fn);
-    };
-    for (const e of graph.edges) {
-      mark(e.from, e.fromFn);
-      mark(e.to, e.toFn);
-    }
-
-    const shownByFile = new Map<string, string[]>();
-    const heights = new Map<string, number>();
-    for (const n of graph.nodes) {
-      const w = wired.get(n.id) ?? new Set();
-      const names = n.functions.map((f) => f.name);
-      const ordered = [...names.filter((f) => w.has(f)), ...names.filter((f) => !w.has(f))];
-      const shown = ordered.slice(0, MAX_ROWS);
-      shownByFile.set(n.id, shown);
-      heights.set(n.id, fileCardHeight(shown.length, names.length - shown.length));
-    }
-
-    const byModule = new Map<string, typeof graph.nodes>();
-    for (const n of graph.nodes) {
-      const m = moduleOf(n.id);
-      if (!byModule.has(m)) byModule.set(m, []);
-      byModule.get(m)!.push(n);
-    }
-
-    const geo = new Map<string, ReturnType<typeof masonry>>();
-    for (const [m, files] of byModule) {
-      geo.set(
-        m,
-        masonry(
-          files.map((f) => ({ id: f.id, h: heights.get(f.id)! })),
-          FILE_W,
-          30,
-        ),
-      );
-    }
-
-    const agg = new Set<string>();
-    for (const e of graph.edges) {
-      const a = moduleOf(e.from);
-      const b = moduleOf(e.to);
-      if (a !== b) agg.add(`${a}→${b}`);
-    }
-    const g = new dagre.graphlib.Graph();
-    g.setDefaultEdgeLabel(() => ({}));
-    g.setGraph({ rankdir: "LR", nodesep: 60, ranksep: 140, marginx: 60, marginy: 60 });
-    for (const [m, mGeo] of geo) g.setNode(m, { width: mGeo.w, height: mGeo.h });
-    for (const k of agg) {
-      const [a, b] = k.split("→");
-      g.setEdge(a, b);
-    }
-    dagre.layout(g);
-
-    const groupNodes: Node[] = [];
-    const childNodes: Node[] = [];
-    for (const [m, files] of byModule) {
-      const mGeo = geo.get(m)!;
-      const pos = g.node(m);
-      groupNodes.push({
-        id: `svc:${m}`,
-        type: "boundary",
-        position: { x: pos.x - mGeo.w / 2, y: pos.y - mGeo.h / 2 },
-        style: { width: mGeo.w, height: mGeo.h },
-        data: { label: m, sub: `${files.length} files`, tone: "service" as const },
-      });
-      for (const n of files) {
-        const shown = shownByFile.get(n.id) ?? [];
-        childNodes.push({
-          id: n.id,
-          type: "file",
-          parentId: `svc:${m}`,
-          extent: "parent",
-          position: mGeo.pos[n.id],
-          data: {
-            name: n.name,
-            dir: n.dir,
-            shownFns: shown,
-            hiddenCount: n.functions.length - shown.length,
-            loc: n.loc,
-            role: n.role,
-            purpose: n.purpose,
-            ai: n.ai,
-            inlet: n.inlet,
-            outlet: n.outlet,
-            uses: n.uses,
-            usedBy: n.usedBy,
-            onOpen: () => onOpenFile(`${projectPath}/${n.id}`),
-            onEdit: () => {
-              setEditTarget(n.id);
-              setEditRequest("");
-            },
-          },
-        });
-      }
-    }
-
-    const rfEdges: Edge[] = [];
-    graph.edges.forEach((e, i) => {
-      if (e.from === e.to) return; // intra-file edges render at detail level
-      const fromShown = shownByFile.get(e.from) ?? [];
-      const toShown = shownByFile.get(e.to) ?? [];
-      const isCall = e.kind === "call";
-      rfEdges.push({
-        id: `e-${i}`,
-        source: e.from,
-        target: e.to,
-        sourceHandle: e.fromFn && fromShown.includes(e.fromFn) ? `out-${e.fromFn}` : "out",
-        targetHandle: e.toFn && toShown.includes(e.toFn) ? `in-${e.toFn}` : "in",
-        animated: isCall,
-        style: isCall
-          ? { stroke: "rgba(124,92,255,0.45)", strokeWidth: 1.5 }
-          : { stroke: "rgba(113,113,122,0.25)", strokeWidth: 1, strokeDasharray: "4 4" },
-      });
-    });
-    return { nodes: [...groupNodes, ...childNodes], edges: rfEdges };
-  }, [graph, level, onOpenFile, projectPath]);
+    layoutCache.current.set(viewKey, result);
+    return result;
+  }, [graph, drill, viewKey, multiModule, onOpenFile, projectPath, drillFile, drillService, activeFeature, playStep]);
 
   const impact = useMemo(() => {
     if (!graph || !editTarget) return null;
@@ -730,45 +999,96 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     setEditRequest("");
   }, [graph, editTarget, editRequest, impact]);
 
-  const callCount = graph?.edges.filter((e) => e.kind === "call").length ?? 0;
-
-  const seg = (l: Level, label: string) => (
-    <button
-      key={l}
-      onClick={() => setZoomLevel(l)}
-      className={`px-2 py-0.5 rounded text-[10px] transition-colors ${
-        level === l ? "bg-violet-500/20 text-violet-200" : "text-zinc-600 hover:text-zinc-300"
-      }`}
-    >
-      {label}
-    </button>
-  );
+  const projectName = projectPath.split("/").pop() ?? projectPath;
 
   return (
     <div className="h-full flex flex-col bg-[#08080c]">
       <div className="h-8 shrink-0 flex items-center gap-2 px-3 border-b border-zinc-800/40 select-none">
-        <span className="text-[10px] font-semibold tracking-widest text-zinc-500">FLOW VIEW</span>
-        <div className="flex items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/60 p-0.5">
-          {seg("modules", "Services")}
-          {seg("files", "Files")}
-          {seg("detail", "Functions")}
+        <span className="text-[10px] font-semibold tracking-widest text-zinc-500">FLOW</span>
+        {drill.length > 0 && (
+          <button
+            onClick={() => setDrill((d) => d.slice(0, -1))}
+            className="text-[12px] text-zinc-500 hover:text-zinc-200 transition-colors"
+            title="Up one level (Esc)"
+          >
+            ←
+          </button>
+        )}
+        <div className="flex items-center gap-1 text-[11px] min-w-0">
+          <button
+            onClick={() => {
+              setDrill([]);
+              setActiveFeature(null);
+              setPlaying(false);
+              setPlayStep(-1);
+            }}
+            className={`truncate transition-colors ${
+              drill.length === 0 && !activeFeature ? "text-violet-300" : "text-zinc-500 hover:text-zinc-200"
+            }`}
+          >
+            ⌂ {projectName}
+          </button>
+          {!activeFeature &&
+            drill.map((c, i) => (
+              <Fragment key={`${c.kind}:${c.id}`}>
+                <span className="text-zinc-700">▸</span>
+                <button
+                  onClick={() => setDrill(drill.slice(0, i + 1))}
+                  className={`truncate transition-colors ${
+                    i === drill.length - 1 ? "text-violet-300" : "text-zinc-500 hover:text-zinc-200"
+                  }`}
+                >
+                  {c.kind === "file" ? c.id.split("/").pop() : c.id}
+                </button>
+              </Fragment>
+            ))}
+          {activeFeature && (
+            <>
+              <span className="text-zinc-700">▸</span>
+              <span className="text-amber-300 truncate">⚡ {activeFeature.name}</span>
+            </>
+          )}
         </div>
-        {graph && (
-          <span className="text-[10px] text-zinc-600">
-            {graph.nodes.length} blocks · {callCount} function links
-            {graph.truncated && " · showing first 400 files"}
-          </span>
+        {activeFeature && (
+          <>
+            <button
+              onClick={() => {
+                if (playing) {
+                  setPlaying(false);
+                } else {
+                  setPlayStep(0);
+                  setPlaying(true);
+                }
+              }}
+              className="text-[10.5px] px-2.5 py-0.5 rounded-md border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 transition-colors shrink-0"
+            >
+              {playing ? "⏸ pause" : "▶ run example"}
+            </button>
+            <button
+              onClick={() => {
+                setActiveFeature(null);
+                setPlaying(false);
+                setPlayStep(-1);
+              }}
+              className="text-[10.5px] px-2 py-0.5 rounded-md border border-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors shrink-0"
+            >
+              ✕ exit
+            </button>
+          </>
         )}
         {loading && graph && (
-          <span className="text-[10px] text-violet-300/80 animate-pulse">rescanning…</span>
+          <span className="text-[10px] text-violet-300/80 animate-pulse shrink-0">rescanning…</span>
         )}
-        {error && <span className="text-[10px] text-red-400 truncate max-w-[260px]">{error}</span>}
+        {error && <span className="text-[10px] text-red-400 truncate max-w-[220px]">{error}</span>}
         <div className="flex-1" />
+        <span className="text-[9.5px] text-zinc-700 hidden lg:block">
+          click a block to go deeper · Esc to go up
+        </span>
         <button
           onClick={annotate}
           disabled={annotating}
           title="Ask Claude to write a one-line purpose on every block (cached — only re-runs for changed files; runs automatically on first open)"
-          className={`text-[10.5px] px-2.5 py-0.5 rounded-md border transition-colors ${
+          className={`text-[10.5px] px-2.5 py-0.5 rounded-md border transition-colors shrink-0 ${
             annotating
               ? "border-violet-500/40 text-violet-300 animate-pulse"
               : "border-violet-500/30 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20"
@@ -783,7 +1103,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
         </button>
         <button
           onClick={refresh}
-          className="text-zinc-600 hover:text-zinc-300 transition-colors text-[13px]"
+          className="text-zinc-600 hover:text-zinc-300 transition-colors text-[13px] shrink-0"
           title="Rescan project"
         >
           ⟳
@@ -798,7 +1118,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
         )}
         {!loading && !error && nodes.length === 0 && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 text-zinc-600">
-            <p className="text-sm">No TypeScript/JavaScript files found</p>
+            <p className="text-sm">Nothing to show here</p>
             <p className="text-[11px] text-zinc-700">
               Flow View maps TS/JS in v1 — more languages later (⌘G for Code view)
             </p>
@@ -810,32 +1130,82 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
           nodeTypes={nodeTypes}
           colorMode="dark"
           fitView
-          fitViewOptions={{ maxZoom: 0.9 }}
+          fitViewOptions={{ maxZoom: 1, padding: 0.15 }}
           minZoom={0.08}
           maxZoom={2.2}
           nodesConnectable={false}
+          nodesDraggable={false}
+          nodesFocusable={false}
+          edgesFocusable={false}
+          elementsSelectable={false}
+          onlyRenderVisibleElements
+          zoomOnDoubleClick={false}
+          proOptions={{ hideAttribution: true }}
           deleteKeyCode={null}
           onInit={(inst) => {
             rfRef.current = inst;
-          }}
-          onMove={(_, vp) => {
-            const l = levelFor(vp.zoom);
-            if (l !== levelRef.current) {
-              levelRef.current = l;
-              setLevel(l);
-            }
           }}
         >
           {/* space mesh: a large grid behind a fine dot field */}
           <Background id="mesh" variant={BackgroundVariant.Lines} gap={140} color="#12121c" />
           <Background id="dots" variant={BackgroundVariant.Dots} gap={24} size={1} color="#1d1d28" />
           <Controls showInteractive={false} />
-          <MiniMap
-            pannable
-            zoomable
-            maskColor="rgba(8,8,12,0.78)"
-            nodeColor={(n) => (n.type === "boundary" ? "#15151f" : "#2d2d3a")}
-          />
+          {nodes.length <= PERF.minimapMax && !activeFeature && (
+            <MiniMap
+              pannable
+              zoomable
+              maskColor="rgba(8,8,12,0.78)"
+              nodeColor={(n) => (n.type === "portal" ? "#15151f" : "#2d2d3a")}
+            />
+          )}
+          <Panel position="bottom-right">
+            <div className="w-[212px] rounded-xl border border-zinc-800 bg-[#101015]/95 shadow-xl p-2.5 select-none">
+              <div className="flex items-center justify-between">
+                <span className="text-[9.5px] font-semibold tracking-widest text-zinc-500">FEATURES</span>
+                <button
+                  onClick={() => loadFeatures(true)}
+                  title="Re-map features with AI"
+                  className="text-zinc-600 hover:text-violet-300 text-[11px] transition-colors"
+                >
+                  ✦
+                </button>
+              </div>
+              {featuresLoading && (
+                <div className="mt-2 text-[10px] text-violet-300 animate-pulse">✦ mapping features…</div>
+              )}
+              {!featuresLoading && features && features.length === 0 && (
+                <div className="mt-2 text-[10px] text-zinc-600">none detected</div>
+              )}
+              {!featuresLoading && !features && (
+                <button
+                  onClick={() => loadFeatures(false)}
+                  className="mt-2 text-[10.5px] text-violet-300 hover:underline"
+                >
+                  ✦ Map features
+                </button>
+              )}
+              <div className="mt-1.5 space-y-1 max-h-[40vh] overflow-y-auto">
+                {features?.map((f) => (
+                  <button
+                    key={f.name}
+                    onClick={() => {
+                      setActiveFeature(f);
+                      setPlaying(false);
+                      setPlayStep(-1);
+                    }}
+                    title={f.description}
+                    className={`w-full text-left px-2 py-1 rounded-md text-[11px] transition-colors ${
+                      activeFeature?.name === f.name
+                        ? "bg-amber-500/20 text-amber-200"
+                        : "text-zinc-400 hover:bg-zinc-800/70 hover:text-zinc-200"
+                    }`}
+                  >
+                    ⚡ {f.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </Panel>
         </ReactFlow>
 
         {peek && (
