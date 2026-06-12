@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use tauri::{AppHandle, Emitter};
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -439,8 +440,15 @@ struct ParsedFile {
 }
 
 #[tauri::command]
-pub fn scan_project(path: String) -> Result<FlowGraph, String> {
-    let root = Path::new(&path);
+pub async fn scan_project(path: String) -> Result<FlowGraph, String> {
+    // Off the main thread — a large project scan must never stall the window.
+    tauri::async_runtime::spawn_blocking(move || scan_project_inner(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn scan_project_inner(path: &str) -> Result<FlowGraph, String> {
+    let root = Path::new(path);
     let (files, truncated) = collect(root);
 
     let rels: Vec<String> = files
@@ -673,14 +681,15 @@ pub fn scan_project(path: String) -> Result<FlowGraph, String> {
     })
 }
 
-#[tauri::command]
-pub fn flow_annotate(project: String) -> Result<usize, String> {
-    let root = Path::new(&project);
+type Needs = Vec<(String, Vec<String>)>;
+
+const ANNOTATE_CHUNK: usize = 30;
+
+fn compute_needs(project: &str) -> Needs {
+    let root = Path::new(project);
     let (files, _truncated) = collect(root);
-
-    let mut cache = load_cache(root);
-    let mut needs: Vec<(String, Vec<String>)> = Vec::new();
-
+    let cache = load_cache(root);
+    let mut needs: Needs = Vec::new();
     for file in &files {
         let Ok(rel) = file.strip_prefix(root) else {
             continue;
@@ -705,11 +714,11 @@ pub fn flow_annotate(project: String) -> Result<usize, String> {
             break;
         }
     }
+    needs
+}
 
-    if needs.is_empty() {
-        return Ok(0);
-    }
-
+fn annotate_chunk(project: &str, chunk: &[(String, Vec<String>)]) -> Result<usize, String> {
+    let root = Path::new(project);
     let mut prompt = String::from(
         "You are labeling blocks in a visual code map for engineers.\n\
          For each file below, write ONE phrase (max 10 words) describing what the file exists FOR \
@@ -718,7 +727,7 @@ pub fn flow_annotate(project: String) -> Result<usize, String> {
          \"draws the flow canvas\", \"talks to the Stripe API\".\n\
          Reply with ONLY a raw JSON object mapping each path to its phrase. No markdown fences, no commentary.\n\nFiles:\n",
     );
-    for (rel, fns) in &needs {
+    for (rel, fns) in chunk {
         if fns.is_empty() {
             prompt.push_str(&format!("- {rel}\n"));
         } else {
@@ -760,8 +769,10 @@ pub fn flow_annotate(project: String) -> Result<usize, String> {
     let purposes: HashMap<String, String> =
         serde_json::from_str(&result).map_err(|e| format!("could not parse annotations: {e}"))?;
 
+    // Re-load and merge per chunk so partial progress is durable immediately.
+    let mut cache = load_cache(root);
     let mut updated = 0;
-    for (rel, _) in &needs {
+    for (rel, _) in chunk {
         if let Some(purpose) = purposes.get(rel) {
             cache.insert(
                 rel.clone(),
@@ -773,7 +784,6 @@ pub fn flow_annotate(project: String) -> Result<usize, String> {
             updated += 1;
         }
     }
-
     let dir = root.join(".newgen");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(
@@ -783,4 +793,42 @@ pub fn flow_annotate(project: String) -> Result<usize, String> {
     .map_err(|e| e.to_string())?;
 
     Ok(updated)
+}
+
+/// Fire-and-forget: returns immediately with how many blocks were queued.
+/// A background thread annotates in chunks and reports via events
+/// (flow-annotate-progress / flow-annotate-done / flow-annotate-error),
+/// so the window never lags while the LLM thinks.
+#[tauri::command]
+pub async fn flow_annotate(app: AppHandle, project: String) -> Result<usize, String> {
+    let needs = {
+        let project = project.clone();
+        tauri::async_runtime::spawn_blocking(move || compute_needs(&project))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let total = needs.len();
+    if total == 0 {
+        return Ok(0);
+    }
+    std::thread::spawn(move || {
+        let mut done = 0usize;
+        for chunk in needs.chunks(ANNOTATE_CHUNK) {
+            match annotate_chunk(&project, chunk) {
+                Ok(_) => {
+                    done += chunk.len();
+                    let _ = app.emit(
+                        "flow-annotate-progress",
+                        serde_json::json!({ "done": done, "total": total }),
+                    );
+                }
+                Err(e) => {
+                    let _ = app.emit("flow-annotate-error", e);
+                    return;
+                }
+            }
+        }
+        let _ = app.emit("flow-annotate-done", total);
+    });
+    Ok(total)
 }

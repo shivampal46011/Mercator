@@ -13,6 +13,7 @@ import {
   type ReactFlowInstance,
 } from "@xyflow/react";
 import dagre from "@dagrejs/dagre";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xyflow/react/dist/style.css";
 import type { FlowGraph } from "../types";
 import { flowAnnotate, readFile, scanProject } from "../lib/ipc";
@@ -267,6 +268,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
   const [graph, setGraph] = useState<FlowGraph | null>(null);
   const [loading, setLoading] = useState(true);
   const [annotating, setAnnotating] = useState(false);
+  const [annotateProgress, setAnnotateProgress] = useState<{ done: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [level, setLevel] = useState<Level>("files");
   const [editTarget, setEditTarget] = useState<string | null>(null);
@@ -318,18 +320,58 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     return () => clearInterval(t);
   }, [refresh, refreshCfg]);
 
+  // Fire-and-forget: the command returns the queued count instantly; progress and
+  // completion arrive as events while the UI stays fully responsive.
   const annotate = useCallback(async () => {
-    setAnnotating(true);
     setError(null);
     try {
-      await flowAnnotate(projectPath);
-      refresh();
+      const queued = await flowAnnotate(projectPath);
+      if (queued > 0) {
+        setAnnotating(true);
+        setAnnotateProgress({ done: 0, total: queued });
+      }
     } catch (e) {
       setError(String(e));
-    } finally {
-      setAnnotating(false);
     }
-  }, [projectPath, refresh]);
+  }, [projectPath]);
+
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+
+  useEffect(() => {
+    const unsubs: UnlistenFn[] = [];
+    let off = false;
+    void (async () => {
+      const onProgress = await listen<{ done: number; total: number }>(
+        "flow-annotate-progress",
+        (e) => {
+          setAnnotateProgress(e.payload);
+          refreshRef.current(); // purposes appear on the map batch by batch
+        },
+      );
+      const onDone = await listen("flow-annotate-done", () => {
+        setAnnotating(false);
+        setAnnotateProgress(null);
+        refreshRef.current();
+      });
+      const onErr = await listen<string>("flow-annotate-error", (e) => {
+        setAnnotating(false);
+        setAnnotateProgress(null);
+        setError(e.payload);
+      });
+      if (off) {
+        onProgress();
+        onDone();
+        onErr();
+        return;
+      }
+      unsubs.push(onProgress, onDone, onErr);
+    })();
+    return () => {
+      off = true;
+      unsubs.forEach((u) => u());
+    };
+  }, []);
 
   useEffect(() => {
     if (!graph || autoRan.current || annotating) return;
@@ -717,6 +759,9 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
             {graph.truncated && " · showing first 400 files"}
           </span>
         )}
+        {loading && graph && (
+          <span className="text-[10px] text-violet-300/80 animate-pulse">rescanning…</span>
+        )}
         {error && <span className="text-[10px] text-red-400 truncate max-w-[260px]">{error}</span>}
         <div className="flex-1" />
         <button
@@ -729,7 +774,12 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
               : "border-violet-500/30 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20"
           }`}
         >
-          ✦ {annotating ? "explaining your code…" : "Re-explain changed"}
+          ✦{" "}
+          {annotating
+            ? annotateProgress
+              ? `explaining… ${annotateProgress.done}/${annotateProgress.total}`
+              : "explaining your code…"
+            : "Re-explain changed"}
         </button>
         <button
           onClick={refresh}
@@ -740,9 +790,10 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
         </button>
       </div>
       <div className="flex-1 min-h-0 relative">
-        {loading && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center text-[12px] text-zinc-500">
-            Mapping your code flow…
+        {loading && !graph && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 text-zinc-500">
+            <div className="size-6 rounded-full border-2 border-violet-500/30 border-t-violet-400 animate-spin" />
+            <span className="text-[12px]">Mapping your code flow…</span>
           </div>
         )}
         {!loading && !error && nodes.length === 0 && (
