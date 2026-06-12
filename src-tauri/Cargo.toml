@@ -1,0 +1,22 @@
+[package]
+name = "newgen-editor"
+version = "0.1.0"
+description = "An AI-native code editor — see your code flow, trust it by behavior"
+edition = "2021"
+
+[lib]
+name = "newgen_editor_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.8"
+regex = "1"
+ignore = "0.4"
+trash = "5"
