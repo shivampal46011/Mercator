@@ -338,9 +338,17 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
   const [activeFeature, setActiveFeature] = useState<Feature | null>(null);
   const [playStep, setPlayStep] = useState(-1);
   const [playing, setPlaying] = useState(false);
+  const [tool, setTool] = useState<"pointer" | "hand">(() =>
+    localStorage.getItem("newgen-flow-tool") === "hand" ? "hand" : "pointer",
+  );
   const autoRan = useRef(false);
   const featuresRan = useRef(false);
   const rfRef = useRef<ReactFlowInstance | null>(null);
+
+  const pickTool = (t: "pointer" | "hand") => {
+    setTool(t);
+    localStorage.setItem("newgen-flow-tool", t);
+  };
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -1005,6 +1013,26 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     <div className="h-full flex flex-col bg-[#08080c]">
       <div className="h-8 shrink-0 flex items-center gap-2 px-3 border-b border-zinc-800/40 select-none">
         <span className="text-[10px] font-semibold tracking-widest text-zinc-500">FLOW</span>
+        <div className="flex items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/60 p-0.5 shrink-0">
+          <button
+            onClick={() => pickTool("pointer")}
+            title="Select tool — click blocks to drill in; pan with right/middle drag or trackpad scroll"
+            className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+              tool === "pointer" ? "bg-violet-500/20 text-violet-200" : "text-zinc-600 hover:text-zinc-300"
+            }`}
+          >
+            ⌖
+          </button>
+          <button
+            onClick={() => pickTool("hand")}
+            title="Hand tool — drag anywhere to pan the canvas (clicks on blocks still work)"
+            className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+              tool === "hand" ? "bg-violet-500/20 text-violet-200" : "text-zinc-600 hover:text-zinc-300"
+            }`}
+          >
+            ✋
+          </button>
+        </div>
         {drill.length > 0 && (
           <button
             onClick={() => setDrill((d) => d.slice(0, -1))}
@@ -1137,7 +1165,8 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
           nodesDraggable={false}
           nodesFocusable={false}
           edgesFocusable={false}
-          elementsSelectable={false}
+          elementsSelectable
+          panOnDrag={tool === "hand" ? true : [1, 2]}
           onlyRenderVisibleElements
           zoomOnDoubleClick={false}
           proOptions={{ hideAttribution: true }}
