@@ -48,3 +48,17 @@ export interface FlowGraph {
   edges: FlowFileEdge[];
   truncated: boolean;
 }
+
+export interface FeatureStep {
+  file: string;
+  fn?: string | null;
+  does: string;
+  example: string;
+}
+
+export interface Feature {
+  name: string;
+  description: string;
+  files: string[];
+  flow: FeatureStep[];
+}
