@@ -16,8 +16,8 @@ import {
 import dagre from "@dagrejs/dagre";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xyflow/react/dist/style.css";
-import type { Feature, FlowGraph } from "../types";
-import { flowAnnotate, flowFeatures, readFile, scanProject } from "../lib/ipc";
+import type { Feature, FlowGraph, TraceStep } from "../types";
+import { featureTrace, flowAnnotate, flowFeatures, readFile, scanProject } from "../lib/ipc";
 import { loadSettings } from "../lib/settings";
 
 const ROLE_STYLE: Record<string, { icon: string; label: string; accent: string; border: string }> = {
@@ -238,17 +238,25 @@ type StepNodeData = {
   does: string;
   example: string;
   state: "done" | "active" | "pending";
+  output?: string;
+  failed: boolean;
+  skipped: boolean;
+  errorMsg?: string;
+  explain?: string;
   onSelect: () => void;
 };
 type StepFlowNode = Node<StepNodeData, "step">;
 
 function StepNode({ data }: NodeProps<StepFlowNode>) {
-  const tone =
-    data.state === "active"
-      ? "border-violet-400 shadow-[0_0_30px_rgba(139,92,246,0.45)]"
-      : data.state === "done"
-        ? "border-violet-500/40"
-        : "border-zinc-800 opacity-75";
+  const tone = data.failed
+    ? "border-red-500 shadow-[0_0_32px_rgba(239,68,68,0.45)]"
+    : data.skipped
+      ? "border-zinc-800 opacity-35"
+      : data.state === "active"
+        ? "border-violet-400 shadow-[0_0_30px_rgba(139,92,246,0.45)]"
+        : data.state === "done"
+          ? "border-violet-500/40"
+          : "border-zinc-800 opacity-75";
   return (
     <div
       onClick={data.onSelect}
@@ -256,17 +264,29 @@ function StepNode({ data }: NodeProps<StepFlowNode>) {
     >
       <Handle type="target" position={Position.Left} id="in" className="!size-1.5 !bg-violet-400/80 !border-0" />
       <Handle type="source" position={Position.Right} id="out" className="!size-1.5 !bg-amber-400/90 !border-0" />
-      <div className="text-[9px] text-zinc-500 tracking-widest">
-        STEP {data.idx + 1}/{data.total}
+      <div className="flex items-center gap-1.5">
+        <span className="text-[9px] text-zinc-500 tracking-widest">
+          STEP {data.idx + 1}/{data.total}
+        </span>
+        {data.failed && <span className="text-[9px] text-red-400 font-semibold">✗ FAILED HERE</span>}
+        {data.skipped && <span className="text-[9px] text-zinc-600">not reached</span>}
       </div>
       <div className="text-[12px] text-zinc-200 mt-0.5 leading-snug">{data.does}</div>
       <div className="text-[9.5px] font-mono text-zinc-500 mt-1 truncate">
         {data.file.split("/").pop()}
         {data.fn ? ` · ƒ ${data.fn}` : ""}
       </div>
-      {data.state === "active" && data.example && (
+      {data.failed && (
+        <div className="mt-2 rounded-lg border border-red-500/40 bg-red-500/10 px-2 py-1.5">
+          <div className="text-[10px] font-mono text-red-300 break-all">{data.errorMsg || "error"}</div>
+          {data.explain && (
+            <div className="mt-1 text-[9.5px] text-zinc-300 leading-snug">✦ {data.explain}</div>
+          )}
+        </div>
+      )}
+      {!data.failed && !data.skipped && data.state === "active" && (data.output || data.example) && (
         <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] font-mono text-amber-200 break-all">
-          {data.example}
+          {data.output || data.example}
         </div>
       )}
     </div>
@@ -338,6 +358,9 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
   const [activeFeature, setActiveFeature] = useState<Feature | null>(null);
   const [playStep, setPlayStep] = useState(-1);
   const [playing, setPlaying] = useState(false);
+  const [traceInput, setTraceInput] = useState("");
+  const [trace, setTrace] = useState<TraceStep[] | null>(null);
+  const [tracing, setTracing] = useState(false);
   const [tool, setTool] = useState<"pointer" | "hand">(() =>
     localStorage.getItem("newgen-flow-tool") === "hand" ? "hand" : "pointer",
   );
@@ -367,6 +390,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     setActiveFeature(null);
     setPlayStep(-1);
     setPlaying(false);
+    setTrace(null);
   }, [projectPath]);
 
   const loadFeatures = useCallback(
@@ -383,16 +407,52 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
     [projectPath],
   );
 
-  // Feature playback: example data hops one step at a time.
+  // Feature playback: example data hops one step at a time; a traced error stops it there.
   useEffect(() => {
     if (!playing || !activeFeature) return;
-    if (playStep >= activeFeature.flow.length - 1) {
+    const errIdx = trace?.findIndex((t) => t.status === "error") ?? -1;
+    const stopAt = errIdx >= 0 ? errIdx : activeFeature.flow.length - 1;
+    if (playStep >= stopAt) {
       setPlaying(false);
       return;
     }
     const t = setTimeout(() => setPlayStep((s) => s + 1), 1500);
     return () => clearTimeout(t);
-  }, [playing, playStep, activeFeature]);
+  }, [playing, playStep, activeFeature, trace]);
+
+  const runTrace = useCallback(async () => {
+    if (!activeFeature || tracing || !traceInput.trim()) return;
+    setTracing(true);
+    setTrace(null);
+    setPlaying(false);
+    setPlayStep(-1);
+    setError(null);
+    try {
+      const t = await featureTrace(projectPath, activeFeature, traceInput.trim());
+      setTrace(t);
+      setPlayStep(0);
+      setPlaying(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setTracing(false);
+    }
+  }, [activeFeature, tracing, traceInput, projectPath]);
+
+  const openFeature = useCallback((f: Feature) => {
+    setActiveFeature(f);
+    setPlaying(false);
+    setPlayStep(-1);
+    setTrace(null);
+    setTraceInput(f.flow[0]?.example ?? "");
+  }, []);
+
+  const closeFeature = useCallback(() => {
+    setActiveFeature(null);
+    setPlaying(false);
+    setPlayStep(-1);
+    setTrace(null);
+  }, []);
 
   useEffect(refresh, [refresh]);
 
@@ -557,6 +617,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
         setActiveFeature(null);
         setPlaying(false);
         setPlayStep(-1);
+        setTrace(null);
       } else setDrill((d) => d.slice(0, -1));
     };
     window.addEventListener("keydown", onKey);
@@ -576,41 +637,56 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
       const steps = activeFeature.flow;
       const W = 250;
       const GAP = 110;
-      const stepNodes: Node[] = steps.map((s, i) => ({
-        id: `step:${i}`,
-        type: "step",
-        position: { x: i * (W + GAP), y: (i % 2) * 36 },
-        data: {
-          idx: i,
-          total: steps.length,
-          file: s.file,
-          fn: s.fn,
-          does: s.does,
-          example: s.example,
-          state: i === playStep ? "active" : i < playStep ? "done" : "pending",
-          onSelect: () => {
-            setPlaying(false);
-            setPlayStep(i);
+      const stepNodes: Node[] = steps.map((s, i) => {
+        const tr = trace?.[i];
+        return {
+          id: `step:${i}`,
+          type: "step",
+          position: { x: i * (W + GAP), y: (i % 2) * 36 },
+          data: {
+            idx: i,
+            total: steps.length,
+            file: s.file,
+            fn: s.fn,
+            does: s.does,
+            example: s.example,
+            state: i === playStep ? "active" : i < playStep ? "done" : "pending",
+            output: tr?.output,
+            failed: tr?.status === "error",
+            skipped: tr?.status === "skipped",
+            errorMsg: tr?.error,
+            explain: tr?.explain,
+            onSelect: () => {
+              setPlaying(false);
+              setPlayStep(i);
+            },
           },
-        },
-      }));
-      const stepEdges: Edge[] = steps.slice(0, -1).map((_, i) => ({
-        id: `se-${i}`,
-        source: `step:${i}`,
-        target: `step:${i + 1}`,
-        sourceHandle: "out",
-        targetHandle: "in",
-        animated: i === playStep,
-        style: {
-          stroke:
-            i < playStep
-              ? "rgba(139,92,246,0.7)"
-              : i === playStep
-                ? "rgba(251,191,36,0.85)"
-                : "rgba(113,113,122,0.3)",
-          strokeWidth: i <= playStep ? 2 : 1.2,
-        },
-      }));
+        };
+      });
+      const stepEdges: Edge[] = steps.slice(0, -1).map((_, i) => {
+        const targetFailed = trace?.[i + 1]?.status === "error";
+        const targetSkipped = trace?.[i + 1]?.status === "skipped";
+        return {
+          id: `se-${i}`,
+          source: `step:${i}`,
+          target: `step:${i + 1}`,
+          sourceHandle: "out",
+          targetHandle: "in",
+          animated: i === playStep && !targetSkipped,
+          style: {
+            stroke: targetFailed
+              ? "rgba(239,68,68,0.8)"
+              : targetSkipped
+                ? "rgba(113,113,122,0.2)"
+                : i < playStep
+                  ? "rgba(139,92,246,0.7)"
+                  : i === playStep
+                    ? "rgba(251,191,36,0.85)"
+                    : "rgba(113,113,122,0.3)",
+            strokeWidth: targetFailed ? 2 : i <= playStep ? 2 : 1.2,
+          },
+        };
+      });
       return { nodes: stepNodes, edges: stepEdges };
     }
 
@@ -972,7 +1048,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
 
     layoutCache.current.set(viewKey, result);
     return result;
-  }, [graph, drill, viewKey, multiModule, onOpenFile, projectPath, drillFile, drillService, activeFeature, playStep]);
+  }, [graph, drill, viewKey, multiModule, onOpenFile, projectPath, drillFile, drillService, activeFeature, playStep, trace]);
 
   const impact = useMemo(() => {
     if (!graph || !editTarget) return null;
@@ -1046,9 +1122,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
           <button
             onClick={() => {
               setDrill([]);
-              setActiveFeature(null);
-              setPlaying(false);
-              setPlayStep(-1);
+              closeFeature();
             }}
             className={`truncate transition-colors ${
               drill.length === 0 && !activeFeature ? "text-violet-300" : "text-zinc-500 hover:text-zinc-200"
@@ -1093,11 +1167,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
               {playing ? "⏸ pause" : "▶ run example"}
             </button>
             <button
-              onClick={() => {
-                setActiveFeature(null);
-                setPlaying(false);
-                setPlayStep(-1);
-              }}
+              onClick={closeFeature}
               className="text-[10.5px] px-2 py-0.5 rounded-md border border-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors shrink-0"
             >
               ✕ exit
@@ -1187,6 +1257,56 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
               nodeColor={(n) => (n.type === "portal" ? "#15151f" : "#2d2d3a")}
             />
           )}
+          {activeFeature && (
+            <Panel position="top-left">
+              <div className="w-[270px] rounded-xl border border-zinc-800 bg-[#101015]/95 shadow-xl p-2.5 select-none">
+                <div className="flex items-center justify-between">
+                  <span className="text-[9.5px] font-semibold tracking-widest text-zinc-500">
+                    TEST INPUT
+                  </span>
+                  {trace && (
+                    <span
+                      className={`text-[9.5px] font-semibold ${
+                        trace.some((t) => t.status === "error") ? "text-red-400" : "text-emerald-400"
+                      }`}
+                    >
+                      {trace.some((t) => t.status === "error")
+                        ? `✗ fails at step ${trace.findIndex((t) => t.status === "error") + 1}`
+                        : "✓ passes all steps"}
+                    </span>
+                  )}
+                </div>
+                <textarea
+                  value={traceInput}
+                  onChange={(e) => setTraceInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      void runTrace();
+                    }
+                  }}
+                  rows={3}
+                  placeholder='your own example, e.g. {"city": "NYC"}'
+                  className="mt-1.5 w-full resize-none rounded-lg border border-zinc-800 bg-zinc-900/60 px-2 py-1.5 text-[11px] font-mono text-zinc-200 placeholder-zinc-600 outline-none focus:border-violet-500/50 transition-colors"
+                />
+                <button
+                  onClick={() => void runTrace()}
+                  disabled={tracing || !traceInput.trim()}
+                  className={`mt-1.5 w-full text-[11px] px-2.5 py-1 rounded-md transition-colors ${
+                    tracing
+                      ? "border border-violet-500/40 text-violet-300 animate-pulse"
+                      : "bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-30"
+                  }`}
+                >
+                  {tracing ? "✦ tracing through real code…" : "▶ Trace my input"}
+                </button>
+                <div className="mt-1.5 text-[8.5px] text-zinc-600 leading-relaxed">
+                  AI dry-run against each step's actual code — real execution arrives with contracts
+                  (M4). ⌘↵ to run.
+                </div>
+              </div>
+            </Panel>
+          )}
           <Panel position="bottom-right">
             <div className="w-[212px] rounded-xl border border-zinc-800 bg-[#101015]/95 shadow-xl p-2.5 select-none">
               <div className="flex items-center justify-between">
@@ -1217,11 +1337,7 @@ export function FlowView({ projectPath, onOpenFile }: Props) {
                 {features?.map((f) => (
                   <button
                     key={f.name}
-                    onClick={() => {
-                      setActiveFeature(f);
-                      setPlaying(false);
-                      setPlayStep(-1);
-                    }}
+                    onClick={() => openFeature(f)}
                     title={f.description}
                     className={`w-full text-left px-2 py-1 rounded-md text-[11px] transition-colors ${
                       activeFeature?.name === f.name

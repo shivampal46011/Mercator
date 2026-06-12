@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DirEntry, Feature, FlowGraph, Persona } from "../types";
+import type { DirEntry, Feature, FlowGraph, Persona, TraceStep } from "../types";
 
 export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
 
@@ -28,6 +28,9 @@ export const flowAnnotate = (project: string) => invoke<number>("flow_annotate",
 
 export const flowFeatures = (project: string, force: boolean) =>
   invoke<Feature[]>("flow_features", { project, force });
+
+export const featureTrace = (project: string, feature: Feature, input: string) =>
+  invoke<TraceStep[]>("feature_trace", { project, feature, input });
 
 export const ensureStandard = (project: string) =>
   invoke<"created" | "aligned" | "foreign">("ensure_standard", { project });

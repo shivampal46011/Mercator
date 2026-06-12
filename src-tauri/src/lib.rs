@@ -125,6 +125,7 @@ pub fn run() {
             scan::scan_project,
             scan::flow_annotate,
             scan::flow_features,
+            scan::feature_trace,
             standard::ensure_standard,
             chat::chat_send,
             chat::chat_cancel,

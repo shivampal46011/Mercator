@@ -821,6 +821,130 @@ fn flow_features_inner(project: &str, force: bool) -> Result<Vec<Feature>, Strin
     Ok(features)
 }
 
+/* ---------- feature trace: dry-run a user's input through a feature ---------- */
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TraceStep {
+    pub status: String, // "ok" | "error" | "skipped"
+    #[serde(default)]
+    pub output: String,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub explain: String,
+}
+
+fn code_slice(
+    root: &Path,
+    file: &str,
+    func: Option<&String>,
+    spans: &HashMap<&str, &Vec<FuncInfo>>,
+) -> String {
+    let Ok(bytes) = std::fs::read(root.join(file)) else {
+        return "    (file unavailable)\n".into();
+    };
+    let content = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = content.lines().collect();
+    let (start, end) = match (func, spans.get(file)) {
+        (Some(f), Some(fns)) => fns
+            .iter()
+            .find(|x| &x.name == f)
+            .map(|x| (x.start_line.saturating_sub(1), x.end_line.min(lines.len())))
+            .unwrap_or((0, lines.len().min(60))),
+        _ => (0, lines.len().min(60)),
+    };
+    let end = end.min(start + 80).min(lines.len());
+    let mut out = String::new();
+    for l in &lines[start..end] {
+        out.push_str("    ");
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+#[tauri::command]
+pub async fn feature_trace(
+    project: String,
+    feature: Feature,
+    input: String,
+) -> Result<Vec<TraceStep>, String> {
+    tauri::async_runtime::spawn_blocking(move || feature_trace_inner(&project, &feature, &input))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn feature_trace_inner(project: &str, feature: &Feature, input: &str) -> Result<Vec<TraceStep>, String> {
+    let root = Path::new(project);
+    let graph = scan_project_inner(project)?;
+    let spans: HashMap<&str, &Vec<FuncInfo>> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), &n.functions))
+        .collect();
+
+    let mut prompt = String::from(
+        "You are dry-running data through a feature pipeline of a codebase. \
+         Trace the INPUT through each STEP using the real code provided.\n\n",
+    );
+    prompt.push_str(&format!("FEATURE: {}\nINPUT: {}\n\nSTEPS:\n", feature.name, input));
+    for (i, s) in feature.flow.iter().enumerate() {
+        prompt.push_str(&format!(
+            "--- step {} ({}{}) : {}\n",
+            i + 1,
+            s.file,
+            s.func.as_ref().map(|f| format!("#{f}")).unwrap_or_default(),
+            s.does
+        ));
+        prompt.push_str(&code_slice(root, &s.file, s.func.as_ref(), &spans));
+    }
+    prompt.push_str(
+        "\nReturn ONLY raw JSON, no markdown fences:\n\
+         {\"steps\":[{\"status\":\"ok|error|skipped\",\"output\":\"the data after this step (tiny, concrete)\",\
+         \"error\":\"error message if status=error\",\"explain\":\"plain-English why it failed and how to fix, max 25 words\"}]}\n\
+         Rules: exactly one object per step, same order as the steps above. Trace realistically against the real code: \
+         type mismatches, missing/invalid fields, failed validation, thrown errors. \
+         If a step fails with this input, its status is error and every later step is skipped. If everything passes, all ok.\n",
+    );
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let output = Command::new(&shell)
+        .arg("-lc")
+        .arg("claude -p \"$NEWGEN_PROMPT\" --output-format json")
+        .current_dir(root)
+        .env("NEWGEN_PROMPT", &prompt)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "claude failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(400)
+                .collect::<String>()
+        ));
+    }
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("bad claude output: {e}"))?;
+    let mut result = envelope["result"].as_str().unwrap_or_default().trim().to_string();
+    if result.starts_with("```") {
+        result = result
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string();
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result).map_err(|e| format!("could not parse trace: {e}"))?;
+    let steps: Vec<TraceStep> = serde_json::from_value(parsed["steps"].clone())
+        .map_err(|e| format!("bad trace shape: {e}"))?;
+    Ok(steps)
+}
+
 /* ---------- per-block AI purposes ---------- */
 
 type Needs = Vec<(String, Vec<String>)>;
