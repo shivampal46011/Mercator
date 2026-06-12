@@ -62,3 +62,10 @@ export interface Feature {
   files: string[];
   flow: FeatureStep[];
 }
+
+export interface TraceStep {
+  status: "ok" | "error" | "skipped";
+  output?: string;
+  error?: string;
+  explain?: string;
+}
