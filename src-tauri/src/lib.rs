@@ -17,7 +17,7 @@ struct DirEntry {
 }
 
 #[tauri::command]
-fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+async fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -37,13 +37,13 @@ fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
 }
 
 #[tauri::command]
-fn read_file(path: String) -> Result<String, String> {
+async fn read_file(path: String) -> Result<String, String> {
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[tauri::command]
-fn write_file(path: String, content: String) -> Result<(), String> {
+async fn write_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
@@ -77,8 +77,11 @@ fn rename_path(from: String, to: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn delete_path(path: String) -> Result<(), String> {
-    trash::delete(&path).map_err(|e| e.to_string())
+async fn delete_path(path: String) -> Result<(), String> {
+    // Finder's trash API can be slow — keep it off the main thread.
+    tauri::async_runtime::spawn_blocking(move || trash::delete(&path).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
